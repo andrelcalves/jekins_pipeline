@@ -1,0 +1,59 @@
+def region = 'us-east-1'
+def repositoryName = "dev/acionamento-whatsapp-repository"
+
+def envVariables = [
+    'HOME=/tmp/home',
+    'DOTNET_CLI_TELEMETRY_OPTOUT=1',
+    'PROJECT_KEY=europ-comunicationgateway-api-develop',
+    'PROJECT_VERSION=1.0'
+]
+
+def ECS_CLUSTER="Cluster-ACIO-WHATSAPP-DEV-INTERNAL"
+
+node('docker') {
+
+    stage('Checkout'){                  
+        git branch: 'develop', credentialsId: 'bc7321d1-6678-469f-a8e2-5c3458989c9e', url: 'http://dce-vstf-srv:8080/tfs/Delivery/_git/CommunicationGateway'
+    }
+
+
+    stage('Code Analysis'){
+        withSonarQubeEnv('SONAR-DEV'){
+            docker.image('nosinovacao/dotnet-sonar:19.09.0').inside(){
+                withEnv(envVariables){
+                    sh 'dotnet /sonar-scanner/SonarScanner.MSBuild.dll begin /k:${PROJECT_KEY} /v:${PROJECT_VERSION} /d:sonar.cs.opencover.reportsPaths="test/**/coverage.opencover.xml" /d:sonar.coverage.exclusions="**Tests*.cs"'
+                    sh 'dotnet build -c Release /property:Version=${PROJECT_VERSION}'
+                    sh 'dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=opencover'
+                    sh 'dotnet /sonar-scanner/SonarScanner.MSBuild.dll end'
+                }
+            }
+        }
+    }
+    
+
+    stage('Build') {
+        docker.build(repositoryName)
+    }
+
+    stage('Publish') {
+        sh(script: "\$(aws ecr get-login --no-include-email --region ${region})")
+        def jsonRegistry = sh(script: "aws ecr describe-repositories --repository-names=${repositoryName}", returnStdout: true)
+        def props = readJSON text: jsonRegistry 
+        def registryId = props.repositories[0].registryId
+
+        docker.withRegistry("https://${registryId}.dkr.ecr.${region}.amazonaws.com"){
+            docker.image(repositoryName).push('latest')
+        }
+    }
+
+    stage('Deploy') {
+
+        def tasks = sh(script: "aws ecs list-tasks --cluster ${ECS_CLUSTER}", returnStdout: true)
+        def taskJson = readJSON text: tasks
+        def taskArns = taskJson.taskArns
+
+        for(taskArn in taskArns){
+            sh "aws ecs stop-task --cluster '${ECS_CLUSTER}' --task ${taskArn}"
+        }
+    }
+}
